@@ -363,8 +363,7 @@ def download_reels(handle, count=12, reels_dir=None):
 
     client = ApifyClient(key)
     run_ = client.actor(REELS_ACTOR).call(
-        run_input={"username": [handle], "resultsLimit": count, "addComments": False},
-        timeout_secs=600)
+        run_input={"username": [handle], "resultsLimit": count, "addComments": False})
     items = list(client.dataset(run_["defaultDatasetId"]).iterate_items())
     items.sort(key=lambda i: i.get("timestamp") or "", reverse=True)
 

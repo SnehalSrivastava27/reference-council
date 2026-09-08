@@ -6,4 +6,4 @@ python-dotenv
 numpy
 pillow
 tenacity           # retry/backoff around the Gemini brief call
-apify-client       # optional — only needed for /brief download=true (reel fetch)
+apify-client<3.0.0 # reel fetch for /brief download=true; <3.0 so .call() returns a subscriptable dict (matches DG-API, which brief.download_reels was copied from)

@@ -1,0 +1,23 @@
+# Secrets — NEVER copy into the image (Coolify injects env vars at runtime).
+.env
+**/.env
+*.env
+
+# Virtualenvs / caches
+.venv
+**/.venv
+**/__pycache__
+**/*.pyc
+
+# Local reel downloads + generated briefs — rebuilt at runtime, not baked in.
+reels/
+*_collab_brief.json
+*_collab_brief.md
+
+# Source brief PDFs and other local docs.
+*.pdf
+
+# VCS / OS cruft
+.git
+.gitignore
+**/.DS_Store

@@ -1,0 +1,16 @@
+# Secrets — must never be committed. Set these as env vars in Coolify instead.
+.env
+*.env
+**/.env
+
+# Local reel downloads + generated artifacts (rebuilt at runtime)
+/reels
+reels/
+*_collab_brief.json
+
+# Virtualenvs / caches / OS cruft
+.venv
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.DS_Store

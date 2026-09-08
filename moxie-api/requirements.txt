@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-multipart
+google-genai
+python-dotenv
+numpy
+pillow
+tenacity           # retry/backoff around the Gemini brief call
+apify-client       # optional — only needed for /brief download=true (reel fetch)

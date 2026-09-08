@@ -30,14 +30,31 @@ from tenacity import (retry, retry_if_exception, stop_after_attempt,
 ROOT = Path(__file__).resolve().parent.parent
 REELS_ACTOR = "xMc5Ga1oCONPmWJIa"  # same dedicated reels actor DG-API uses
 
+# Real-people reel frames (faces, skin, bodies) routinely trip Gemini's DEFAULT
+# safety thresholds, which returns a 200 with an empty candidate and no text —
+# the "Gemini did not return JSON" failures seen at scale. This is benign beauty
+# content, so turn blocking off for every category.
+_SAFETY_OFF = [
+    types.SafetySetting(category=c, threshold=types.HarmBlockThreshold.BLOCK_NONE)
+    for c in (
+        types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+        types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+        types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+    )
+]
+
 # ---------------------------------------------------------------------------
 # Portal contract, as a Gemini response_schema. This is the SUBSET the model
 # produces — igUrl / videoFile / pairsWith are filled by assemble_brief(), NOT
 # the model, so they cannot drift. Keys/shape match creator_portal's CollabBrief
 # (no `beats`, no `words` — the portal removed them).
 # ---------------------------------------------------------------------------
+FIVE_THINGS = ("Background", "Lighting", "Pacing", "Hook", "Outfit")
+
 _LOVED = {
     "type": "OBJECT",
+    "propertyOrdering": ["label", "time", "note"],
     "properties": {
         "label": {"type": "STRING", "description": "Background / Lighting / Pacing / Hook / Outfit / etc."},
         "time": {"type": "STRING", "description": "timestamp like 0:38, or empty"},
@@ -48,13 +65,18 @@ _LOVED = {
 
 BRIEF_SCHEMA = {
     "type": "OBJECT",
+    # Gemini emits keys in this order. Its default is ALPHABETICAL, which made the
+    # model write fiveThings/film before it had chosen the reels they build on.
+    "propertyOrdering": ["reels", "refs", "whyYou", "film", "fiveThings", "products", "mustHaveShots"],
     "properties": {
         "whyYou": {"type": "STRING", "description": "two warm sentences, naming one of her reels"},
         "reels": {
             "type": "ARRAY",
-            "description": "the 2-3 shortlisted reels, best-of-a-different-parameter each",
+            "description": "THREE shortlisted reels, each the best example of a different parameter; two only when no third reel deserves it",
+            "minItems": 2, "maxItems": 3,
             "items": {
                 "type": "OBJECT",
+                "propertyOrdering": ["reel", "title", "loved"],
                 "properties": {
                     "reel": {"type": "STRING", "description": "the reel's filename stem EXACTLY as in creator_analysis.json, e.g. 06_Da2qlkpyJqG"},
                     "title": {"type": "STRING", "description": "short descriptor, e.g. 'B.Ed Student GRWM'"},
@@ -66,8 +88,10 @@ BRIEF_SCHEMA = {
         "refs": {
             "type": "ARRAY",
             "description": "one Moxie reference reel per shortlisted reel, max 3",
+            "minItems": 1, "maxItems": 3,
             "items": {
                 "type": "OBJECT",
+                "propertyOrdering": ["libraryHandle", "pairsWithReel", "share"],
                 "properties": {
                     "libraryHandle": {"type": "STRING", "description": "a handle from moxie_reference_library.md"},
                     "pairsWithReel": {"type": "STRING", "description": "the filename stem of the creator reel this pairs with"},
@@ -78,6 +102,7 @@ BRIEF_SCHEMA = {
         },
         "film": {
             "type": "OBJECT",
+            "propertyOrdering": ["idea", "format", "length"],
             "properties": {
                 "idea": {"type": "STRING", "description": "the Core Message to Land, one line"},
                 "format": {"type": "STRING", "description": "e.g. 'Reel · 9:16'"},
@@ -87,12 +112,14 @@ BRIEF_SCHEMA = {
         },
         "fiveThings": {
             "type": "ARRAY",
-            "description": "exactly five, labelled Background, Lighting, Pacing, Hook, Outfit",
+            "description": "exactly five, in this order: Background, Lighting, Pacing, Hook, Outfit",
+            "minItems": 5, "maxItems": 5,
             "items": {
                 "type": "OBJECT",
+                "propertyOrdering": ["label", "items"],
                 "properties": {
-                    "label": {"type": "STRING"},
-                    "items": {"type": "ARRAY", "items": {"type": "STRING"}},
+                    "label": {"type": "STRING", "enum": list(FIVE_THINGS)},
+                    "items": {"type": "ARRAY", "minItems": 1, "items": {"type": "STRING"}},
                 },
                 "required": ["label", "items"],
             },
@@ -119,21 +146,35 @@ Return a single JSON object that is the creator-facing collab brief, matching th
 provided schema. It is the artifact the creator films against — no scores, no
 criticism, nothing that does not help her shoot. Specifically:
 
-- reels: shortlist the best 2-3 reels. Set each reel's "reel" field to that reel's
-  filename stem EXACTLY as it appears in creator_analysis.json (e.g. 06_Da2qlkpyJqG)
-  — do NOT invent a URL or a filename; the pipeline fills those. Each reel gets
-  warm, specific praise in "loved": one entry per parameter with a timestamp and
-  why it matters. Pick reels that between them show DIFFERENT strengths.
+- reels: shortlist THREE reels, each the best example of a DIFFERENT strength.
+  You have a contact sheet for every reel — judge all of them, not just the ones
+  the machine score ranks highest. Fall back to two only when no third reel
+  reaches 4 on any parameter; never pad, but never default to two either. Set
+  each reel's "reel" field to that reel's filename stem EXACTLY as it appears in
+  creator_analysis.json (e.g. 06_Da2qlkpyJqG) — do NOT invent a URL or a
+  filename; the pipeline fills those. Each reel gets warm, specific praise in
+  "loved": one entry per parameter with a timestamp and why it matters.
+- Background is judged indoors-first. The collab is shot in her home, so an
+  indoor frame with a doorway, receding room or textured wall (archetypes 1 and 2
+  in backgrounds_and_lighting.md) outranks an outdoor frame with equal
+  separation. Shortlist an outdoor reel for Background only when no indoor reel
+  reaches 4. A COOL / underlit lighting flag on an indoor reel is not a reason to
+  skip it — praise its background and fix the light in the Lighting spec.
+- Outfit is mandatory. Praise it in "loved" on at least one reel, naming the
+  garment, colour and neckline you can see in the frames.
 - refs: for each shortlisted reel choose ONE Moxie reference from
   moxie_reference_library.md. Set "libraryHandle" to its handle, "pairsWithReel"
   to the filename stem of the creator reel it pairs with, and "share" to one
   sentence naming the overlap — match on the strength you praised, not the topic.
   Maximum three.
 - film.idea: the Core Message to Land, in one line.
-- fiveThings: five entries labelled Background, Lighting, Pacing, Hook, Outfit,
-  each a specification tailored to her (two locations one brighter; where the hair
-  light comes from and the time of day; pacing as a number; the hook written out;
-  the outfit change) — per brief_writer.md.
+- fiveThings: five entries, in order and labelled exactly Background, Lighting,
+  Pacing, Hook, Outfit, each a specification tailored to her — per brief_writer.md:
+  Background = two rooms she already filmed in, named from her reels, one brighter
+  for the reveal (exteriors only if the campaign brief asks for them); Lighting =
+  where the hair light comes from and the time of day; Pacing = a number; Hook =
+  written out; Outfit = Look 1 (routine) and Look 2 (reveal) as colours, necklines
+  and fabrics, then two or three things to avoid against the named backgrounds.
 - products: the Moxie SKUs / items she will use.
 - mustHaveShots: a real shot list — the specific CAMERA SHOTS she must capture,
   each as framing + subject + action (e.g. "Macro close-up of the scalp parting —
@@ -288,8 +329,8 @@ def validate_brief(b: dict) -> None:
     if not isinstance(b, dict):
         raise ValueError("brief is not an object")
     reels = b.get("reels") or []
-    if not reels:
-        raise ValueError("no reels")
+    if len(reels) < 2:
+        raise ValueError(f"only {len(reels)} reel(s) shortlisted — need 2-3")
     for i, r in enumerate(reels):
         if not (r.get("title") and r.get("igUrl") and r.get("videoFile")):
             raise ValueError(f"reel {i} missing title/igUrl/videoFile")
@@ -301,6 +342,10 @@ def validate_brief(b: dict) -> None:
         raise ValueError("film.idea missing")
     if not b.get("mustHaveShots"):
         raise ValueError("mustHaveShots empty")
+    five = {t.get("label"): [x for x in (t.get("items") or []) if x] for t in (b.get("fiveThings") or [])}
+    missing = [l for l in FIVE_THINGS if not five.get(l)]
+    if missing:
+        raise ValueError(f"fiveThings missing or empty: {missing}")
     if _has_forbidden(b):
         raise ValueError("brief contains forbidden beats/words keys")
 
@@ -330,9 +375,25 @@ def generate_brief(client, model, contents, handle, manifest, ref_lib,
         model=model, contents=contents,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=BRIEF_SCHEMA))
+            response_schema=BRIEF_SCHEMA,
+            safety_settings=_SAFETY_OFF,
+            # A full brief (reels, five specs, shots) is long — give it room so
+            # structured output isn't truncated mid-JSON (a MAX_TOKENS finish).
+            max_output_tokens=8192))
+    text = resp.text
+    if not text:
+        # 200 with no text: say WHY (safety block, MAX_TOKENS, empty) so the log
+        # is actionable instead of a bare "did not return JSON". Still a
+        # ValueError, so tenacity retries it.
+        fr = pf = None
+        try:
+            fr = resp.candidates[0].finish_reason
+        except (AttributeError, IndexError, TypeError):
+            pass
+        pf = getattr(resp, "prompt_feedback", None)
+        raise ValueError(f"Gemini returned no text (finish_reason={fr}, prompt_feedback={pf})")
     try:
-        model_out = json.loads(resp.text)
+        model_out = json.loads(text)
     except (json.JSONDecodeError, TypeError) as e:
         raise ValueError(f"Gemini did not return JSON: {e}")
     brief = assemble_brief(handle, model_out, manifest, ref_lib, moxie_refs_dir)
@@ -416,7 +477,7 @@ def _selftest():
             {"libraryHandle": "nutellaonella", "pairsWithReel": "02_DbnmPDZSSrl", "share": "warm side-light"},
         ],
         "film": {"idea": "heal the scalp barrier", "format": "Reel · 9:16", "length": "45-55 sec"},
-        "fiveThings": [{"label": "Background", "items": ["staircase", "window"]}],
+        "fiveThings": [{"label": l, "items": [f"{l} spec"]} for l in FIVE_THINGS],
         "products": ["Moxie Pre-Wash"],
         "mustHaveShots": ["Macro close-up of the scalp parting."],
     }
@@ -439,6 +500,9 @@ def _selftest():
 
     # validation actually rejects bad output
     for bad in ({"reels": []},
+                {**b, "reels": b["reels"][:1]},                       # one reel is not a shortlist
+                {**b, "fiveThings": b["fiveThings"][:4]},              # Outfit dropped
+                {**b, "fiveThings": b["fiveThings"][:4] + [{"label": "Outfit", "items": []}]},
                 {"reels": b["reels"], "refs": [], "film": b["film"], "mustHaveShots": ["x"]},
                 {**b, "beats": [1]}):
         try:

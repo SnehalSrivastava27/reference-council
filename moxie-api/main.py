@@ -40,12 +40,13 @@ SKILL_DIR = Path(os.environ.get(
     Path(__file__).resolve().parent.parent / "moxie-taste"))
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 ANALYZE_SCRIPT = SKILL_DIR / "scripts" / "analyze_creator.py"
-MAX_IMAGES = 24  # sheets first, then hook frames — flash handles this fine
+MAX_IMAGES = 80  # safety net only: 12 sheets + 3 hook frames x 12 reels = 48
 
 # The skill's own files ARE the prompt. Loaded fresh per request so edits to
 # the skill take effect without a restart.
 PROMPT_FILES = [
     "references/scoring_rubric.md",
+    "references/backgrounds_and_lighting.md",
     "references/hook_library.md",
     "references/moxie_reference_library.md",
     "references/brief_template.md",
@@ -68,7 +69,8 @@ pairing library (stage 0). Otherwise score against the house standard.
 Return ONLY a JSON object with these keys:
   "scorecard": internal — per reel: five parameter scores 1-5 with one-line
                reasons, rejection reasons, risk flags. Never shown to the creator.
-  "shortlist": the best 2-3 reels, each with specific warm praise per parameter.
+  "shortlist": the best 3 reels (2 only if no third deserves it), each with
+               specific warm praise per parameter.
   "reference_pairing": for each shortlisted reel, the paired Moxie reference
                reel and why it rhymes.
   "brief": the full creator-facing collab brief as markdown, per the template.
@@ -141,13 +143,19 @@ def _analyze(handle, src, workdir):
     out = workdir / "out"
     proc = subprocess.run(
         [sys.executable, str(ANALYZE_SCRIPT), str(src),
-         "--handle", handle, "--outdir", str(out)],
+         "--handle", handle, "--outdir", str(out),
+         # Every reel gets a contact sheet. The triage gate is a roster-screening
+         # tool: it ranks on lighting + pacing only, so it dropped the indoor
+         # reels (cooler, dimmer) and Gemini never saw their backgrounds.
+         "--review-all"],
         capture_output=True, text=True, timeout=600)
     if proc.returncode != 0:
         raise HTTPException(500, f"analyze_creator.py failed: {proc.stderr[-2000:]}")
     machine = json.loads((out / "creator_analysis.json").read_text())
     images = sorted((out / "sheets").glob("*.jpg")) if (out / "sheets").is_dir() else []
-    images += sorted((out / "hooks").rglob("*.jpg")) if (out / "hooks").is_dir() else []
+    # hook frames are 3s at 2fps; every other one (0s, 1s, 2s) reads caption timing fine
+    for d in sorted((out / "hooks").iterdir()) if (out / "hooks").is_dir() else []:
+        images += sorted(d.glob("*.jpg"))[::2]
     return machine, images[:MAX_IMAGES], out
 
 

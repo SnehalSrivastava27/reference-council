@@ -317,6 +317,9 @@ def main():
                     help="max reels to render contact sheets for (vision budget)")
     ap.add_argument("--min-machine", type=int, default=MIN_MACHINE,
                     help="machine score floor for review")
+    ap.add_argument("--review-all", action="store_true",
+                    help="contact sheet for EVERY measured reel, ignoring the triage gate — for "
+                         "briefing an already-chosen creator (Background/Hook/Outfit are invisible to the machine score)")
     ap.add_argument("--no-sheets", action="store_true",
                     help="measurement only — no images. Use for a first pass over a large roster.")
     args = ap.parse_args()
@@ -348,8 +351,14 @@ def main():
 
     # Stage 3 — render contact sheets ONLY for the top survivors.
     rendered = 0
-    if not args.no_sheets and verdict != "AUTO-REJECT":
-        for rec in [r for r in results if r["review"]][:args.review_top]:
+    if args.review_all:
+        pool = [r for r in results if not r.get("error")]
+    elif verdict != "AUTO-REJECT":
+        pool = [r for r in results if r["review"]][:args.review_top]
+    else:
+        pool = []
+    if not args.no_sheets:
+        for rec in pool:
             render(rec, args.outdir)
             rendered += 1
 

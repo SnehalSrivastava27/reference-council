@@ -34,7 +34,11 @@ REELS_ACTOR = "xMc5Ga1oCONPmWJIa"  # same dedicated reels actor DG-API uses
 # safety thresholds, which returns a 200 with an empty candidate and no text —
 # the "Gemini did not return JSON" failures seen at scale. This is benign beauty
 # content, so turn blocking off for every category.
-_SAFETY_OFF = [
+#
+# These are the only FOUR categories the API lets you configure. A block with
+# prompt_feedback.block_reason=PROHIBITED_CONTENT comes from a separate,
+# non-configurable filter that BLOCK_NONE cannot reach — see PromptBlocked.
+SAFETY_OFF = [
     types.SafetySetting(category=c, threshold=types.HarmBlockThreshold.BLOCK_NONE)
     for c in (
         types.HarmCategory.HARM_CATEGORY_HARASSMENT,
@@ -43,6 +47,39 @@ _SAFETY_OFF = [
         types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
     )
 ]
+
+
+class PromptBlocked(Exception):
+    """Gemini rejected the INPUT (prompt_feedback.block_reason), before generating.
+    One bad frame out of ~48 kills the whole request. Deterministic — the same
+    contents block every time — so this is deliberately NOT a ValueError: tenacity
+    re-raises it immediately instead of burning four more full uploads, and the
+    caller can find the offending reel, drop it, and run the rest."""
+
+    def __init__(self, reason):
+        super().__init__(f"Gemini blocked the prompt ({reason})")
+        self.reason = reason
+
+
+def block_reason(resp):
+    """The prompt-level block reason on a response, or None."""
+    return getattr(getattr(resp, "prompt_feedback", None), "block_reason", None)
+
+
+def reel_of_image(path):
+    """Which reel an analyze-pass frame belongs to. analyze_creator.render() writes
+    sheets/<reel>.jpg and hooks/<reel>/<n>.jpg — both name the reel."""
+    p = Path(path)
+    return p.stem if p.parent.name == "sheets" else p.parent.name
+
+
+def drop_reels(images, machine, names):
+    """Remove whole reels from the vision input AND from creator_analysis.json, so
+    the model cannot shortlist a reel it was never shown."""
+    names = set(names)
+    kept_imgs = [i for i in images if reel_of_image(i) not in names]
+    kept_reels = [r for r in (machine.get("reels") or []) if r.get("reel") not in names]
+    return kept_imgs, {**machine, "reels": kept_reels, "reel_count": len(kept_reels)}
 
 # ---------------------------------------------------------------------------
 # Portal contract, as a Gemini response_schema. This is the SUBSET the model
@@ -376,22 +413,24 @@ def generate_brief(client, model, contents, handle, manifest, ref_lib,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=BRIEF_SCHEMA,
-            safety_settings=_SAFETY_OFF,
+            safety_settings=SAFETY_OFF,
             # A full brief (reels, five specs, shots) is long — give it room so
             # structured output isn't truncated mid-JSON (a MAX_TOKENS finish).
             max_output_tokens=8192))
     text = resp.text
     if not text:
         # 200 with no text: say WHY (safety block, MAX_TOKENS, empty) so the log
-        # is actionable instead of a bare "did not return JSON". Still a
-        # ValueError, so tenacity retries it.
-        fr = pf = None
+        # is actionable instead of a bare "did not return JSON".
+        reason = block_reason(resp)
+        if reason:
+            raise PromptBlocked(reason)  # input refused; retrying changes nothing
+        fr = None
         try:
             fr = resp.candidates[0].finish_reason
         except (AttributeError, IndexError, TypeError):
             pass
-        pf = getattr(resp, "prompt_feedback", None)
-        raise ValueError(f"Gemini returned no text (finish_reason={fr}, prompt_feedback={pf})")
+        # anything else (MAX_TOKENS, empty candidate) is worth another attempt
+        raise ValueError(f"Gemini returned no text (finish_reason={fr})")
     try:
         model_out = json.loads(text)
     except (json.JSONDecodeError, TypeError) as e:
@@ -497,6 +536,38 @@ def _selftest():
     assert b["refs"][0]["igUrl"] == "https://www.instagram.com/reel/ABC123/"
     assert b["refs"][1]["igUrl"] == "https://www.instagram.com/nutellaonella/"
     assert not _has_forbidden(b)
+
+    # a blocked reel is dropped from BOTH the frames and creator_analysis.json
+    imgs = [Path("out/sheets/01_AAA.jpg"), Path("out/sheets/02_BBB.jpg"),
+            Path("out/hooks/01_AAA/00.jpg"), Path("out/hooks/02_BBB/00.jpg")]
+    assert [reel_of_image(i) for i in imgs] == ["01_AAA", "02_BBB", "01_AAA", "02_BBB"]
+    kept, m = drop_reels(imgs, {"handle": "x", "reel_count": 2,
+                                "reels": [{"reel": "01_AAA"}, {"reel": "02_BBB"}]}, ["02_BBB"])
+    assert [i.name for i in kept] == ["01_AAA.jpg", "00.jpg"], kept
+    assert m["reels"] == [{"reel": "01_AAA"}] and m["reel_count"] == 1, m
+    assert m["handle"] == "x"  # untouched keys survive
+
+    # an input block raises PromptBlocked and is NOT retried (4 uploads of ~48
+    # frames each, for a rejection that is identical every time)
+    calls = []
+
+    class _FakeClient:
+        class models:
+            @staticmethod
+            def generate_content(**kw):
+                calls.append(kw)
+                return type("R", (), {
+                    "text": None,
+                    "prompt_feedback": type("P", (), {"block_reason": "PROHIBITED_CONTENT"})(),
+                })()
+
+    try:
+        generate_brief(_FakeClient(), "m", ["prompt"], "@x", {}, {})
+    except PromptBlocked as e:
+        assert e.reason == "PROHIBITED_CONTENT", e
+    else:
+        raise AssertionError("expected PromptBlocked")
+    assert len(calls) == 1, f"input block must not retry (made {len(calls)} calls)"
 
     # validation actually rejects bad output
     for bad in ({"reels": []},

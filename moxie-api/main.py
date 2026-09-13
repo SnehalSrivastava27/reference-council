@@ -20,6 +20,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -177,43 +178,91 @@ def analyze(
     src = _reels_src(reels, reels_dir, brief.norm_handle(handle), workdir)
     machine, images, out = _analyze(handle, src, workdir)
 
-    contents: list = [skill_prompt(), TASK]
-    if campaign_brief:
-        contents.append(f"===== CAMPAIGN BRIEF (stage 0) =====\n{campaign_brief}")
-    if brief_pdf:
-        contents.append("===== CAMPAIGN BRIEF PDF (stage 0) =====")
-        contents.append(types.Part.from_bytes(
-            data=brief_pdf.file.read(), mime_type="application/pdf"))
-    contents.append("===== creator_analysis.json =====\n" + json.dumps(machine, indent=2))
-    for img in images:
-        contents.append(f"IMAGE: {img.relative_to(out)}")
-        contents.append(types.Part.from_bytes(data=img.read_bytes(), mime_type="image/jpeg"))
+    pdf_bytes = brief_pdf.file.read() if brief_pdf else None
+    contents = _contents(TASK, machine, images, out, campaign_brief, pdf_bytes)
 
-    resp = gemini().models.generate_content(
-        model=MODEL, contents=contents,
-        config=types.GenerateContentConfig(response_mime_type="application/json"))
+    excluded = []
     try:
-        review = json.loads(resp.text)
-    except (json.JSONDecodeError, TypeError):
-        review = {"raw": resp.text}
+        review = _review_json(contents)
+    except brief.PromptBlocked as e:
+        contents, images, excluded = _contents_minus_blocked(
+            TASK, e.reason, machine, images, out, campaign_brief, pdf_bytes)
+        review = _review_json(contents)
 
     return {"handle": handle, "model": MODEL, "machine": machine,
-            "images_reviewed": len(images), "review": review}
+            "images_reviewed": len(images), "excluded_reels": excluded,
+            "review": review}
 
 
-def _brief_contents(machine, images, out, campaign_brief, brief_pdf):
-    contents: list = [skill_prompt(), brief.BRIEF_TASK]
+def _contents(task, machine, images, out, campaign_brief, pdf_bytes):
+    """The prompt for one creator: skill docs, the task, the campaign brief, the
+    measurements, then every frame. pdf_bytes (not the UploadFile) because the
+    prompt is rebuilt on a safety-block retry and a file object only reads once."""
+    contents: list = [skill_prompt(), task]
     if campaign_brief:
         contents.append(f"===== CAMPAIGN BRIEF (stage 0) =====\n{campaign_brief}")
-    if brief_pdf:
+    if pdf_bytes:
         contents.append("===== CAMPAIGN BRIEF PDF (stage 0) =====")
-        contents.append(types.Part.from_bytes(
-            data=brief_pdf.file.read(), mime_type="application/pdf"))
+        contents.append(types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"))
     contents.append("===== creator_analysis.json =====\n" + json.dumps(machine, indent=2))
     for img in images:
         contents.append(f"IMAGE: {img.relative_to(out)}")
         contents.append(types.Part.from_bytes(data=img.read_bytes(), mime_type="image/jpeg"))
     return contents
+
+
+def _probe_reel(item):
+    """Do this reel's own frames trip the block? Returns the reel name, or None."""
+    name, imgs = item
+    parts = [types.Part.from_bytes(data=i.read_bytes(), mime_type="image/jpeg")
+             for i in imgs]
+    try:
+        resp = gemini().models.generate_content(
+            model=MODEL, contents=["Reply with: ok"] + parts,
+            config=types.GenerateContentConfig(max_output_tokens=16,
+                                               safety_settings=brief.SAFETY_OFF))
+    except Exception:
+        return None  # transient API error — never drop a reel on a failed probe
+    return name if brief.block_reason(resp) else None
+
+
+def _blocked_reels(images):
+    """Which reels Gemini refuses to look at. One small probe per reel, in parallel:
+    roughly the image-token cost of a single full request, and it names EVERY
+    offender — a bisect would find one and block again on the next."""
+    by_reel = {}
+    for img in images:
+        by_reel.setdefault(brief.reel_of_image(img), []).append(img)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        return sorted(n for n in pool.map(_probe_reel, by_reel.items()) if n)
+
+
+def _contents_minus_blocked(task, reason, machine, images, out, campaign_brief, pdf_bytes):
+    """Recovery after a PromptBlocked: find the offending reel(s), drop them, and
+    rebuild the prompt from the rest so one bad reel doesn't waste the whole run."""
+    excluded = _blocked_reels(images)
+    if not excluded:
+        raise HTTPException(422, f"Gemini blocked the prompt ({reason}) and no single "
+                                 "reel reproduces it on its own — the campaign brief "
+                                 "text/PDF is the likely trigger.")
+    images, machine = brief.drop_reels(images, machine, excluded)
+    return _contents(task, machine, images, out, campaign_brief, pdf_bytes), images, excluded
+
+
+def _review_json(contents):
+    """/analyze's Gemini call. Surfaces an input block instead of silently
+    returning {"raw": None}."""
+    resp = gemini().models.generate_content(
+        model=MODEL, contents=contents,
+        config=types.GenerateContentConfig(response_mime_type="application/json",
+                                           safety_settings=brief.SAFETY_OFF))
+    reason = brief.block_reason(resp)
+    if reason:
+        raise brief.PromptBlocked(reason)
+    try:
+        return json.loads(resp.text)
+    except (json.JSONDecodeError, TypeError):
+        return {"raw": resp.text}
 
 
 @app.post("/brief")
@@ -237,16 +286,30 @@ def brief_endpoint(
     manifest = brief.load_manifest(src)
     ref_lib = brief.parse_reference_library(
         (SKILL_DIR / "references" / "moxie_reference_library.md").read_text())
-    contents = _brief_contents(machine, images, out, campaign_brief, brief_pdf)
+    pdf_bytes = brief_pdf.file.read() if brief_pdf else None
+    contents = _contents(brief.BRIEF_TASK, machine, images, out, campaign_brief, pdf_bytes)
 
-    result = brief.generate_brief(
-        gemini(), MODEL, contents, h, manifest, ref_lib,
-        moxie_refs_dir=ROOT / "reels" / "_moxie_refs")
+    def run(c):
+        return brief.generate_brief(gemini(), MODEL, c, h, manifest, ref_lib,
+                                    moxie_refs_dir=ROOT / "reels" / "_moxie_refs")
+
+    excluded = []
+    try:
+        result = run(contents)
+    except brief.PromptBlocked as e:
+        # One unviewable reel out of a dozen used to waste the whole request.
+        # Name it, drop it, brief the creator off the reels that are fine.
+        contents, images, excluded = _contents_minus_blocked(
+            brief.BRIEF_TASK, e.reason, machine, images, out, campaign_brief, pdf_bytes)
+        try:
+            result = run(contents)
+        except brief.PromptBlocked as e2:
+            raise HTTPException(422, f"still blocked ({e2.reason}) after excluding {excluded}")
 
     dest = ROOT / f"{h}_collab_brief.json"
     dest.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
     return {"handle": h, "model": MODEL, "images_reviewed": len(images),
-            "written": str(dest), "brief": result}
+            "excluded_reels": excluded, "written": str(dest), "brief": result}
 
 
 @app.get("/reel/{handle}/{filename:path}")
